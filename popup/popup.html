@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meet Join Sound Replacer</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Meet Join Sound</h1>
+      <p class="subtitle">Replace the Google Meet join ding</p>
+    </header>
+
+    <label class="row switch-row">
+      <span>Enabled</span>
+      <input type="checkbox" id="enabled" />
+    </label>
+
+    <fieldset id="modeFieldset">
+      <legend>Replacement mode</legend>
+      <label class="radio">
+        <input type="radio" name="mode" value="tts" />
+        Text-to-speech
+      </label>
+      <label class="radio">
+        <input type="radio" name="mode" value="custom" />
+        Custom sound
+      </label>
+      <label class="radio">
+        <input type="radio" name="mode" value="mute" />
+        Mute only
+      </label>
+    </fieldset>
+
+    <section id="ttsSection" class="section hidden">
+      <label for="ttsText">Phrase</label>
+      <input type="text" id="ttsText" maxlength="120" placeholder="User joined" />
+    </section>
+
+    <section id="customSection" class="section hidden">
+      <label for="soundFile">Audio file (max 2 MB)</label>
+      <input type="file" id="soundFile" accept="audio/*,.mp3,.wav,.ogg,.m4a" />
+      <div class="row actions">
+        <span id="soundStatus" class="hint">No sound uploaded</span>
+        <button type="button" id="clearSound" class="linkish" hidden>Clear</button>
+      </div>
+    </section>
+
+    <label class="row">
+      <span>Volume</span>
+      <input type="range" id="volume" min="0" max="1" step="0.05" />
+      <span id="volumeValue" class="hint">80%</span>
+    </label>
+
+    <div class="row actions">
+      <button type="button" id="preview">Preview</button>
+      <span id="status" class="hint" role="status"></span>
+    </div>
+
+    <p class="footer-note">
+      Open a Meet tab after changing settings. Reload the Meet page if you just
+      installed the extension.
+    </p>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
