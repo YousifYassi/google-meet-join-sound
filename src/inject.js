@@ -4,7 +4,7 @@
 
   const EVENT_PREFIX = "meet-join-sound-replacer";
   const MAX_UI_SOUND_DURATION = 3;
-  const GSTATIC_HINT = /gstatic\.com|googleusercontent\.com|meet\.google\.com/i;
+  const GSTATIC_HINT = /gstatic\.com|googleusercontent\.com/i;
 
   let suppressEnabled = true;
 
@@ -29,40 +29,38 @@
     }
   }
 
-  function isVideoElement(el) {
-    return el instanceof HTMLVideoElement;
-  }
-
   function looksLikeUiSound(el) {
-    if (isVideoElement(el)) return false;
-    if (!(el instanceof HTMLAudioElement) && el.tagName !== "AUDIO") {
-      // Audio() creates HTMLAudioElement; also catch generic media used for cues
-      if (!(el instanceof HTMLMediaElement)) return false;
-    }
+    // Never touch video tiles or live WebRTC streams (participant audio).
+    if (!(el instanceof HTMLAudioElement)) return false;
+    if (el.srcObject) return false;
+
+    const duration = el.duration;
+    // Live/stream media reports Infinity; never treat that as a UI ding.
+    if (duration === Infinity) return false;
 
     const src = mediaSrc(el);
-    const duration = Number.isFinite(el.duration) ? el.duration : NaN;
+    const finiteDuration = Number.isFinite(duration) ? duration : NaN;
 
-    // Meet often plays short notification clips; skip long media.
-    if (Number.isFinite(duration) && duration > MAX_UI_SOUND_DURATION) {
+    // Meet join/notification clips are short files, usually from gstatic.
+    if (Number.isFinite(finiteDuration) && finiteDuration > MAX_UI_SOUND_DURATION) {
       return false;
     }
 
-    // No src yet / blob / data / gstatic — treat short audio as UI cue.
-    if (!src || src.startsWith("blob:") || src.startsWith("data:")) {
-      return !Number.isFinite(duration) || duration <= MAX_UI_SOUND_DURATION;
+    if (src && GSTATIC_HINT.test(src)) {
+      return !Number.isFinite(finiteDuration) || finiteDuration <= MAX_UI_SOUND_DURATION;
     }
 
-    if (GSTATIC_HINT.test(src)) {
-      return !Number.isFinite(duration) || duration <= MAX_UI_SOUND_DURATION;
+    // Short blob/data clips without a MediaStream are typical notification sounds.
+    if (src.startsWith("blob:") || src.startsWith("data:")) {
+      return !Number.isFinite(finiteDuration) || finiteDuration <= MAX_UI_SOUND_DURATION;
     }
 
-    // Unknown remote audio: only suppress if clearly very short.
-    if (Number.isFinite(duration) && duration > 0 && duration <= MAX_UI_SOUND_DURATION) {
+    // Empty src without srcObject is uncommon for live audio; only suppress if
+    // duration is already known and clearly a short cue.
+    if (!src && Number.isFinite(finiteDuration) && finiteDuration > 0 && finiteDuration <= MAX_UI_SOUND_DURATION) {
       return true;
     }
 
-    // Duration unknown (NaN) and not an obvious Meet asset — do not suppress.
     return false;
   }
 
@@ -70,20 +68,11 @@
 
   HTMLMediaElement.prototype.play = function play(...args) {
     if (suppressEnabled && looksLikeUiSound(this)) {
-      try {
-        this.muted = true;
-        this.volume = 0;
-        this.pause();
-        this.currentTime = 0;
-      } catch (_) {
-        /* ignore */
-      }
-
+      // Do not mutate muted/volume — Meet may reuse elements.
       emit("ui-sound-suppressed", {
         src: mediaSrc(this),
         duration: this.duration,
       });
-
       return Promise.resolve();
     }
 
