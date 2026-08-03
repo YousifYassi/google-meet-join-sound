@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Meet Join Sound Replacer",
-  "version": "1.0.1",
+  "version": "1.0.4",
   "description": "Replace Google Meet's join ding with a custom sound or text-to-speech.",
   "permissions": ["storage"],
   "host_permissions": ["https://meet.google.com/*"],
