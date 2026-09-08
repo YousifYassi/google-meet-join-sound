@@ -27,6 +27,8 @@
   let knownParticipantNames = new Set();
   let inCall = false;
   let ignoreJoinsUntil = 0;
+  /** True while this tab's user is presenting / screen sharing. */
+  let isLocalPresenting = false;
   /** @type {Map<string, number>} */
   const seenJoinToasts = new Map();
 
@@ -36,6 +38,33 @@
   let pendingScanTimer = null;
   /** @type {string | null} */
   let pendingPlayName = null;
+
+  /** Tile / overflow menu labels that must never be treated as people. */
+  const UI_CHROME_LABELS = new Set([
+    "remove this tile",
+    "minimise",
+    "minimize",
+    "pin to the screen",
+    "pin for everyone",
+    "unpin",
+    "unpin from the screen",
+    "show my full video to others",
+    "hide my full video from others",
+    "mute",
+    "unmute",
+    "mute for everyone",
+    "more options",
+    "more actions",
+    "spotlight",
+    "remove spotlight",
+    "add to spotlight",
+    "expand",
+    "collapse",
+    "close",
+    "picture in picture",
+    "enter picture in picture",
+    "exit picture in picture",
+  ]);
 
   function clampVolume(value) {
     const n = Number(value);
@@ -72,11 +101,86 @@
     );
   }
 
+  function getEffectiveMode() {
+    // Avoid announcing over a local screen share (audio may be captured).
+    if (isLocalPresenting) return "mute";
+    return settings.mode;
+  }
+
+  function isMutedMode() {
+    return getEffectiveMode() === "mute";
+  }
+
+  function stopAnnouncements() {
+    cancelPendingPlay();
+    try {
+      window.speechSynthesis.cancel();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function detectLocalPresenting() {
+    // Prefer stable control labels over class names (Meet DOM churns often).
+    const selectors = [
+      '[aria-label*="Stop presenting" i]',
+      '[aria-label*="Stop sharing" i]',
+      '[aria-label*="You are presenting" i]',
+      '[aria-label*="You are sharing" i]',
+      '[data-is-presenting="true"]',
+      // Tooltip / title fallbacks on the present control.
+      '[title*="Stop presenting" i]',
+      '[title*="You are presenting" i]',
+    ];
+    for (const sel of selectors) {
+      if (document.querySelector(sel)) return true;
+    }
+    return false;
+  }
+
+  function updatePresentingState() {
+    const wasPresenting = isLocalPresenting;
+    isLocalPresenting = detectLocalPresenting();
+    if (isLocalPresenting && !wasPresenting) {
+      stopAnnouncements();
+      // Treat presentation tile churn as known so it isn't a join when sharing ends.
+      refreshParticipantBaseline();
+    } else if (!isLocalPresenting && wasPresenting) {
+      refreshParticipantBaseline();
+    }
+  }
+
   function joinsAllowed() {
     if (!settings.enabled) return false;
     if (document.visibilityState !== "visible") return false;
     if (Date.now() < ignoreJoinsUntil) return false;
     return true;
+  }
+
+  function isInsideUiChrome(el) {
+    if (!(el instanceof Element)) return false;
+    return Boolean(
+      el.closest('[role="menu"], [role="menuitem"], [role="listbox"]')
+    );
+  }
+
+  function isUiChromeLabel(raw) {
+    if (!raw) return true;
+    const label = raw.replace(/\s+/g, " ").trim().toLowerCase();
+    if (!label) return true;
+    if (UI_CHROME_LABELS.has(label)) return true;
+    // Screen-share tile actions: "Don't watch Jane", "Watch Jane", etc.
+    if (
+      /^don'?t\s+watch\b/i.test(label) ||
+      /^stop\s+watching\b/i.test(label) ||
+      /^watch\s+.+/i.test(label)
+    ) {
+      return true;
+    }
+    // Action-style chrome that isn't a person name.
+    return /^(remove|minimi[sz]e|pin|unpin|mute|unmute|hide|show|spotlight|expand|collapse|close|more options|more actions|picture[- ]in[- ]picture)\b/i.test(
+      label
+    );
   }
 
   function canPlayNow() {
@@ -150,7 +254,7 @@
       lastPlayWasNameless = false;
       lastPlayAt = Date.now();
       rememberParticipantName(name);
-      if (settings.mode === "tts") {
+      if (getEffectiveMode() === "tts") {
         playTts(`${name} joined`);
       }
       return;
@@ -158,10 +262,10 @@
 
     cancelPendingPlay();
     if (!joinsAllowed()) return;
-    if (settings.mode === "mute") return;
+    if (isMutedMode()) return;
     if (!canPlayNow()) return;
 
-    if (settings.mode === "custom") {
+    if (getEffectiveMode() === "custom") {
       lastPlayWasNameless = false;
       if (name) rememberParticipantName(name);
       else syncKnownParticipantNames();
@@ -214,7 +318,7 @@
    */
   function schedulePlay(optionalName) {
     if (!joinsAllowed()) return;
-    if (settings.mode === "mute") return;
+    if (isMutedMode()) return;
 
     const name =
       typeof optionalName === "string" && optionalName.trim()
@@ -265,6 +369,7 @@
     name = name.replace(/\s*[-–—].*$/, "").trim();
     if (!name || name.length > 80) return null;
     if (/^(you|me|someone|a user|user)$/i.test(name)) return null;
+    if (isUiChromeLabel(name)) return null;
     return name;
   }
 
@@ -312,6 +417,18 @@
     );
   }
 
+  function textLooksLikePresenting(text) {
+    const cleaned = normalizeToastText(text);
+    if (!cleaned || cleaned.length > 160) return false;
+    return (
+      /\b(?:started|is|stopped)\s+presenting\b/i.test(cleaned) ||
+      /\b(?:started|is|stopped)\s+sharing(?:\s+(?:their|a)\s+screen)?\b/i.test(
+        cleaned
+      ) ||
+      /\byou\s+are\s+(?:presenting|sharing)\b/i.test(cleaned)
+    );
+  }
+
   function getSelfName() {
     const el = document.querySelector("[data-self-name]");
     const attr = el?.getAttribute("data-self-name");
@@ -330,6 +447,7 @@
     };
 
     document.querySelectorAll("[data-self-name]").forEach((el) => {
+      if (isInsideUiChrome(el)) return;
       add(el.getAttribute("data-self-name"));
     });
 
@@ -338,6 +456,13 @@
         "[data-participant-id], [data-allocation-index], [data-requested-participant-id]"
       )
       .forEach((el) => {
+        if (isInsideUiChrome(el)) return;
+        // Ignore overflow menus rendered inside a tile.
+        if (el.querySelector('[role="menu"], [role="menuitem"]')) {
+          const label = el.getAttribute("aria-label") || "";
+          if (label) add(label.split(",")[0]);
+          return;
+        }
         const label = el.getAttribute("aria-label") || "";
         if (label) add(label.split(",")[0]);
       });
@@ -347,6 +472,8 @@
         '[aria-label*="Participants" i] [role="listitem"], [aria-label*="People" i] [role="listitem"]'
       )
       .forEach((el) => {
+        if (isInsideUiChrome(el)) return;
+        if (el.querySelector('[role="menu"], [role="menuitem"]')) return;
         const label = el.getAttribute("aria-label") || "";
         if (label) {
           add(label.split(",")[0].split("\n")[0]);
@@ -424,16 +551,16 @@
 
   function armVisibilityGrace() {
     ignoreJoinsUntil = Date.now() + VISIBILITY_GRACE_MS;
-    cancelPendingPlay();
+    stopAnnouncements();
+    updatePresentingState();
     refreshParticipantBaseline();
-    try {
-      window.speechSynthesis.cancel();
-    } catch (_) {
-      /* ignore */
-    }
   }
 
   function handleToastText(text) {
+    if (textLooksLikePresenting(text)) {
+      updatePresentingState();
+      return;
+    }
     if (textLooksLikeLeave(text)) {
       cancelPendingPlay();
       return;
@@ -484,6 +611,7 @@
 
   function onPossibleParticipantChange() {
     if (!settings.enabled) return;
+    updatePresentingState();
 
     const nowInCall = detectInCall();
     if (nowInCall && !inCall) {
@@ -497,6 +625,7 @@
       participantBaseline = null;
       knownParticipantNames = new Set();
       cancelPendingPlay();
+      isLocalPresenting = false;
       return;
     }
 
@@ -509,7 +638,7 @@
       return;
     }
 
-    if (!joinsAllowed()) {
+    if (!joinsAllowed() || isMutedMode()) {
       cancelPendingPlay();
       participantBaseline = count;
       syncKnownParticipantNames();
@@ -531,7 +660,8 @@
   }
 
   function onUiSoundSuppressed() {
-    if (!joinsAllowed()) return;
+    updatePresentingState();
+    if (!joinsAllowed() || isMutedMode()) return;
     if (!inCall && !detectInCall()) return;
     inCall = true;
 
@@ -567,12 +697,7 @@
     if (document.visibilityState === "visible") {
       armVisibilityGrace();
     } else {
-      cancelPendingPlay();
-      try {
-        window.speechSynthesis.cancel();
-      } catch (_) {
-        /* ignore */
-      }
+      stopAnnouncements();
     }
   });
 
@@ -582,32 +707,57 @@
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
-    loadSettings();
+    loadSettings().then(() => {
+      if (isMutedMode()) stopAnnouncements();
+    });
   });
 
   const observer = new MutationObserver((mutations) => {
     if (!settings.enabled) return;
 
     let shouldScanParticipants = false;
+    let sawNonMenuDomChange = false;
     for (const mutation of mutations) {
       if (mutation.type === "childList") {
         shouldScanParticipants = true;
-        if (!joinsAllowed()) continue;
         for (const node of mutation.addedNodes) {
           if (node.nodeType === Node.ELEMENT_NODE) {
-            scanForJoinToasts(node);
+            if (!isInsideUiChrome(node)) {
+              sawNonMenuDomChange = true;
+              if (joinsAllowed()) scanForJoinToasts(node);
+            }
           } else if (node.nodeType === Node.TEXT_NODE) {
-            handleToastText(node.textContent || "");
+            if (!isInsideUiChrome(node.parentElement)) {
+              sawNonMenuDomChange = true;
+              if (joinsAllowed()) handleToastText(node.textContent || "");
+            }
+          }
+        }
+        if (mutation.removedNodes.length > 0) {
+          for (const node of mutation.removedNodes) {
+            if (
+              node.nodeType === Node.ELEMENT_NODE &&
+              !isInsideUiChrome(node)
+            ) {
+              sawNonMenuDomChange = true;
+              break;
+            }
           }
         }
       } else if (mutation.type === "characterData") {
+        const parent = mutation.target?.parentElement;
+        if (isInsideUiChrome(parent)) continue;
+        sawNonMenuDomChange = true;
         if (!joinsAllowed()) continue;
         handleToastText(mutation.target?.textContent || "");
       }
     }
 
-    if (shouldScanParticipants) {
+    // Opening a tile overflow menu should not look like a participant join.
+    if (shouldScanParticipants && sawNonMenuDomChange) {
       onPossibleParticipantChange();
+    } else if (shouldScanParticipants) {
+      updatePresentingState();
     }
   });
 
@@ -623,6 +773,7 @@
 
   loadSettings().then(() => {
     startObserver();
+    updatePresentingState();
     refreshParticipantBaseline();
     ignoreJoinsUntil = Date.now() + VISIBILITY_GRACE_MS;
     setInterval(() => {
