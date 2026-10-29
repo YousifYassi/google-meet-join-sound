@@ -8,6 +8,8 @@
   // If a generic announcement already started, allow a late name to replace it.
   const NAME_UPGRADE_MS = 2500;
   const PENDING_SCAN_INTERVAL_MS = 200;
+  // Presentation tiles appear/disappear when anyone shares; ignore that churn.
+  const PRESENTATION_GRACE_MS = 2500;
 
   const DEFAULTS = {
     enabled: true,
@@ -65,6 +67,16 @@
     "enter picture in picture",
     "exit picture in picture",
   ]);
+
+  // Opt-in: run localStorage.meetJoinSoundDebug = "1" in the Meet tab's console.
+  function debugLog(...args) {
+    try {
+      if (localStorage.getItem("meetJoinSoundDebug") !== "1") return;
+    } catch (_) {
+      return;
+    }
+    console.log("[meet-join-sound]", ...args);
+  }
 
   function clampVolume(value) {
     const n = Number(value);
@@ -243,6 +255,7 @@
       typeof optionalName === "string" && optionalName.trim()
         ? optionalName.trim()
         : null;
+    debugLog("commitPlay", { name, mode: getEffectiveMode() });
 
     // Late named toast after a generic "User joined" — interrupt and upgrade.
     if (
@@ -369,6 +382,14 @@
     name = name.replace(/\s*[-–—].*$/, "").trim();
     if (!name || name.length > 80) return null;
     if (/^(you|me|someone|a user|user)$/i.test(name)) return null;
+    // Status copy from the People card ("1 joined", "0 also invited ...",
+    // "Loading invitees") is never a person's name.
+    if (/^\d/.test(name)) return null;
+    if (/\b(?:joined|joining|invited|invitees?|loading|left)\b/i.test(name)) {
+      return null;
+    }
+    // Counts like "1 joined" / "3 others" from the People hover card.
+    if (/^\d+(?:\s+(?:people|others?|participants?))?$/i.test(name)) return null;
     if (isUiChromeLabel(name)) return null;
     return name;
   }
@@ -397,6 +418,9 @@
   function textLooksLikeJoin(text) {
     const cleaned = normalizeToastText(text);
     if (!cleaned || cleaned.length > 120) return false;
+    // People hover card summary ("1 joined", "4 people joined"), not a toast.
+    if (/^\d+\s+(?:\w+\s+)?joined\b/i.test(cleaned)) return false;
+    if (/^loading\b|\binvitees?\b/i.test(cleaned)) return false;
     // Require a leading name — bare "joined" is too ambiguous / partial.
     return (
       /^.+?\s+(?:has\s+)?joined(?:\s+the\s+(?:meeting|call))?\.?$/i.test(
@@ -418,10 +442,12 @@
   }
 
   function textLooksLikePresenting(text) {
-    const cleaned = normalizeToastText(text);
+    // Whole text, not just the first line: tiles render "Name\nName is presenting".
+    const cleaned = (text || "").replace(/\s+/g, " ").trim();
     if (!cleaned || cleaned.length > 160) return false;
     return (
       /\b(?:started|is|stopped)\s+presenting\b/i.test(cleaned) ||
+      /\(presentation\)/i.test(cleaned) ||
       /\b(?:started|is|stopped)\s+sharing(?:\s+(?:their|a)\s+screen)?\b/i.test(
         cleaned
       ) ||
@@ -447,7 +473,7 @@
     };
 
     document.querySelectorAll("[data-self-name]").forEach((el) => {
-      if (isInsideUiChrome(el)) return;
+      if (isInsideUiChrome(el) || isInsidePeopleCard(el)) return;
       add(el.getAttribute("data-self-name"));
     });
 
@@ -456,7 +482,7 @@
         "[data-participant-id], [data-allocation-index], [data-requested-participant-id]"
       )
       .forEach((el) => {
-        if (isInsideUiChrome(el)) return;
+        if (isInsideUiChrome(el) || isInsidePeopleCard(el)) return;
         // Ignore overflow menus rendered inside a tile.
         if (el.querySelector('[role="menu"], [role="menuitem"]')) {
           const label = el.getAttribute("aria-label") || "";
@@ -472,7 +498,7 @@
         '[aria-label*="Participants" i] [role="listitem"], [aria-label*="People" i] [role="listitem"]'
       )
       .forEach((el) => {
-        if (isInsideUiChrome(el)) return;
+        if (isInsideUiChrome(el) || isInsidePeopleCard(el)) return;
         if (el.querySelector('[role="menu"], [role="menuitem"]')) return;
         const label = el.getAttribute("aria-label") || "";
         if (label) {
@@ -508,26 +534,63 @@
     if (name) knownParticipantNames.add(name);
   }
 
+  function isPresentationLabel(label) {
+    return /\bpresent(?:ation|ing)\b/i.test(label || "");
+  }
+
+  /**
+   * Count distinct people, not elements. A screen share adds a second tile for
+   * the presenter, and the People hover card adds avatars; neither is a join.
+   */
   function countParticipantButtons() {
     const selectors = [
       '[aria-label*="Participants" i] [role="listitem"]',
       '[aria-label*="People" i] [role="listitem"]',
       "[data-participant-id]",
       "[data-self-name]",
+      "[data-requested-participant-id]",
+      "[data-allocation-index]",
     ];
 
-    const found = new Set();
+    const keys = new Set();
     for (const sel of selectors) {
-      document.querySelectorAll(sel).forEach((el) => found.add(el));
+      document.querySelectorAll(sel).forEach((el) => {
+        if (isInsideUiChrome(el) || isInsidePeopleCard(el)) return;
+        const label =
+          el.getAttribute("data-self-name") ||
+          (el.getAttribute("aria-label") || "").split(",")[0];
+        const name = cleanDisplayName(label);
+        if (name) {
+          keys.add(`name:${name.toLowerCase()}`);
+          return;
+        }
+        if (isPresentationLabel(label)) return;
+        const id =
+          el.getAttribute("data-participant-id") ||
+          el.getAttribute("data-requested-participant-id");
+        if (id) keys.add(`id:${id}`);
+      });
     }
 
-    document
-      .querySelectorAll(
-        "[data-requested-participant-id], [data-allocation-index]"
-      )
-      .forEach((el) => found.add(el));
+    return keys.size;
+  }
 
-    return found.size;
+  function onPresentationChange() {
+    // Absorb the tile churn into the baseline instead of announcing it.
+    ignoreJoinsUntil = Math.max(
+      ignoreJoinsUntil,
+      Date.now() + PRESENTATION_GRACE_MS
+    );
+    cancelPendingPlay();
+    updatePresentingState();
+  }
+
+  function nodeLooksLikePresentation(node) {
+    if (!(node instanceof HTMLElement)) return false;
+    if (isPresentationLabel(node.getAttribute("aria-label"))) return true;
+    if (node.querySelector('[aria-label*="presentation" i]')) return true;
+    const text = node.innerText || "";
+    return text.length < 160 && textLooksLikePresenting(text);
   }
 
   function detectInCall() {
@@ -556,17 +619,78 @@
     refreshParticipantBaseline();
   }
 
-  function handleToastText(text) {
+  /**
+   * The People hover card (avatar / count, top right) shows "1 joined",
+   * "Loading invitees", etc. Detect it by its fixed copy rather than classes.
+   */
+  /** @type {{ at: number, roots: Element[] }} */
+  let peopleCardCache = { at: 0, roots: [] };
+
+  function findPeopleCardRoots() {
+    const now = Date.now();
+    if (now - peopleCardCache.at < 250) return peopleCardCache.roots;
+
+    const roots = [];
+    const body = document.body;
+    if (body) {
+      // Anchor on the card's footer link, then climb only until the container
+      // also holds the card's summary/buttons. That stays inside the card
+      // instead of swallowing nearby video tiles.
+      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          return /^\s*(?:view everyone in this call|loading invitees)\s*$/i.test(
+            node.nodeValue || ""
+          )
+            ? NodeFilter.FILTER_ACCEPT
+            : NodeFilter.FILTER_SKIP;
+        },
+      });
+      let text = walker.nextNode();
+      while (text) {
+        let node = text.parentElement;
+        for (let depth = 0; node && depth < 12; depth++) {
+          if (
+            /add people|host controls|\bjoined\b|just you|also invited/i.test(
+              node.textContent || ""
+            )
+          ) {
+            roots.push(node);
+            break;
+          }
+          node = node.parentElement;
+        }
+        text = walker.nextNode();
+      }
+    }
+
+    peopleCardCache = { at: now, roots };
+    return roots;
+  }
+
+  /**
+   * The People hover card (avatar / count, top right) shows "1 joined",
+   * "Loading invitees", etc. Detect it by its fixed copy rather than classes.
+   */
+  function isInsidePeopleCard(el) {
+    if (!(el instanceof Element)) return false;
+    return findPeopleCardRoots().some((root) => root.contains(el));
+  }
+
+  function handleToastText(text, sourceEl = null) {
     if (textLooksLikePresenting(text)) {
-      updatePresentingState();
+      onPresentationChange();
       return;
     }
     if (textLooksLikeLeave(text)) {
       cancelPendingPlay();
       return;
     }
-    if (textLooksLikeJoin(text) && rememberToast(text)) {
-      schedulePlay(parseJoinName(text));
+    if (!textLooksLikeJoin(text) || isInsidePeopleCard(sourceEl)) return;
+    // No parsable name means it isn't a real join notification.
+    const name = parseJoinName(text);
+    debugLog("join text", { text, name });
+    if (name && rememberToast(text)) {
+      schedulePlay(name);
     }
   }
 
@@ -602,7 +726,7 @@
     while (node) {
       const text = (node.innerText || node.textContent || "").trim();
       if (textLooksLikeLeave(text) || textLooksLikeJoin(text)) {
-        handleToastText(text);
+        handleToastText(text, node);
         if (textLooksLikeJoin(text)) return;
       }
       node = walker.nextNode();
@@ -631,6 +755,15 @@
 
     const count = countParticipantButtons();
     const newestName = findNewestParticipantName();
+    if (count !== participantBaseline || newestName) {
+      debugLog("participants", {
+        count,
+        baseline: participantBaseline,
+        newestName,
+        known: [...knownParticipantNames],
+        joinsAllowed: joinsAllowed(),
+      });
+    }
 
     if (participantBaseline === null) {
       participantBaseline = count;
@@ -660,6 +793,7 @@
   }
 
   function onUiSoundSuppressed() {
+    debugLog("Meet UI sound suppressed");
     updatePresentingState();
     if (!joinsAllowed() || isMutedMode()) return;
     if (!inCall && !detectInCall()) return;
@@ -667,6 +801,15 @@
 
     const count = countParticipantButtons();
     const newestName = findNewestParticipantName();
+    if (count !== participantBaseline || newestName) {
+      debugLog("participants", {
+        count,
+        baseline: participantBaseline,
+        newestName,
+        known: [...knownParticipantNames],
+        joinsAllowed: joinsAllowed(),
+      });
+    }
 
     if (participantBaseline === null) {
       participantBaseline = count;
@@ -724,12 +867,13 @@
           if (node.nodeType === Node.ELEMENT_NODE) {
             if (!isInsideUiChrome(node)) {
               sawNonMenuDomChange = true;
+              if (nodeLooksLikePresentation(node)) onPresentationChange();
               if (joinsAllowed()) scanForJoinToasts(node);
             }
           } else if (node.nodeType === Node.TEXT_NODE) {
             if (!isInsideUiChrome(node.parentElement)) {
               sawNonMenuDomChange = true;
-              if (joinsAllowed()) handleToastText(node.textContent || "");
+              if (joinsAllowed()) handleToastText(node.textContent || "", node.parentElement);
             }
           }
         }
@@ -740,7 +884,7 @@
               !isInsideUiChrome(node)
             ) {
               sawNonMenuDomChange = true;
-              break;
+              if (nodeLooksLikePresentation(node)) onPresentationChange();
             }
           }
         }
@@ -749,7 +893,10 @@
         if (isInsideUiChrome(parent)) continue;
         sawNonMenuDomChange = true;
         if (!joinsAllowed()) continue;
-        handleToastText(mutation.target?.textContent || "");
+        handleToastText(
+          mutation.target?.textContent || "",
+          mutation.target?.parentElement
+        );
       }
     }
 
